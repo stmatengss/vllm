@@ -4,8 +4,9 @@
 Encoder-cache (EC) connector backed by Mooncake TransferEngine.
 
 Used in disaggregated setups where an encoder / prefill instance produces
-multimodal encoder outputs and a decode instance loads them over RDMA-capable
-Mooncake transport instead of shared filesystem.
+multimodal encoder outputs and a decode instance loads them over Mooncake
+(TCP by default; RDMA when ``mooncake_protocol`` is set) instead of a
+shared filesystem.
 """
 
 from __future__ import annotations
@@ -621,9 +622,11 @@ class ECMooncakeConnector(ECConnectorBase):
     Extra config (``ec_connector_extra_config``):
 
     - ``mooncake_protocol`` (optional): Passed to ``TransferEngine.initialize``
-      (default ``"rdma"``).
+      (default ``"tcp"``, which works without RDMA NICs; set ``"rdma"``
+      when GPUDirect RDMA is available).
     - ``consumer_buffer_pool_size`` (consumer, optional): Bytes reserved for a
-      long-lived registered CUDA receive arena (default ``ec_buffer_size``).
+      long-lived registered receive arena (pinned host for TCP, CUDA for
+      RDMA; default ``ec_buffer_size``).
     - ``reservation_zmq_port`` (consumer worker, required): Exposes registered
       receive addresses over ZMQ. Replica ``d`` of the first pipeline stage owns
       the block starting at ``port + d * tensor_parallel_size``; tensor-parallel
@@ -705,7 +708,9 @@ class ECMooncakeConnector(ECConnectorBase):
         assert ec_cfg is not None
         self._ec_cfg = ec_cfg
         self._extra = self._ec_cfg.ec_connector_extra_config
-        self._protocol: str = self._extra.get("mooncake_protocol", "rdma")
+        self._protocol: str = str(
+            self._extra.get("mooncake_protocol", "tcp")
+        ).lower()
         reservation_port = self._extra.get("reservation_zmq_port")
         self._reservation_zmq_port = (
             int(reservation_port) if reservation_port is not None else None
@@ -863,9 +868,10 @@ class ECMooncakeConnector(ECConnectorBase):
                 raise RuntimeError("Mooncake TransferEngine initialization failed.")
             self._engine = eng
             logger.info(
-                "ECMooncakeConnector TransferEngine ready at %s:%d",
+                "ECMooncakeConnector TransferEngine ready at %s:%d protocol=%s",
                 self._hostname,
                 eng.get_rpc_port(),
+                self._protocol,
             )
         return self._engine
 
@@ -1040,19 +1046,55 @@ class ECMooncakeConnector(ECConnectorBase):
                 self._pending_unregister.pop(address, None)
             return True
 
+    def _uses_host_transport(self) -> bool:
+        """TCP cannot GPUDirect; buffers live in pinned host memory."""
+        return self._protocol == "tcp"
+
+    def _transport_device(self, requested: torch.device) -> torch.device:
+        if self._uses_host_transport():
+            return torch.device("cpu")
+        return requested
+
+    def _encoder_cache_device(self) -> torch.device:
+        raw = self._ec_cfg.ec_buffer_device
+        name = raw.lower() if isinstance(raw, str) and raw else "cuda"
+        if name == "cuda" and not torch.cuda.is_available():
+            return torch.device("cpu")
+        return torch.device(name)
+
+    def _alloc_transport_buffer(
+        self, nbytes: int, device: torch.device
+    ) -> torch.Tensor:
+        kwargs: dict[str, Any] = {}
+        if device.type == "cpu":
+            kwargs["pin_memory"] = torch.cuda.is_available()
+        return torch.empty(nbytes, dtype=torch.uint8, device=device, **kwargs)
+
+    def _materialize_for_encoder_cache(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Move TCP host buffers onto the encoder-cache device."""
+        if tensor.device.type != "cpu" or not self._uses_host_transport():
+            return tensor
+        target = self._encoder_cache_device()
+        if tensor.device.type == target.type:
+            return tensor
+        return tensor.to(device=target, non_blocking=False)
+
     def _ensure_consumer_pool(
         self, device: torch.device, *, allow_host: bool = False
     ) -> None:
+        device = self._transport_device(device)
         if (
             self._consumer_pool is not None
             or self._consumer_pool_disabled
-            or (device.type != "cuda" and not allow_host)
+            or (
+                device.type != "cuda"
+                and not allow_host
+                and not self._uses_host_transport()
+            )
         ):
             return
         try:
-            pool = torch.empty(
-                self._consumer_pool_capacity, dtype=torch.uint8, device=device
-            )
+            pool = self._alloc_transport_buffer(self._consumer_pool_capacity, device)
             if self._is_receiving_rank:
                 # Producers write into this pool directly, so it needs a memory
                 # region. Later pipeline stages never receive and skip it.
@@ -1072,8 +1114,9 @@ class ECMooncakeConnector(ECConnectorBase):
         self._consumer_pool = pool
         self._consumer_pool_allocator = _ContiguousAllocator(pool.nbytes)
         logger.info(
-            "Prepared %d-byte CUDA receive pool for Mooncake EC (registered=%s)",
+            "Prepared %d-byte %s receive pool for Mooncake EC (registered=%s)",
             pool.nbytes,
+            device.type,
             self._is_receiving_rank,
         )
 
@@ -1082,16 +1125,18 @@ class ECMooncakeConnector(ECConnectorBase):
 
         Registering the encoder output itself costs more than the transfer
         (register+unregister dominated the push path); staging into a slab
-        that is registered once trades that for a device-to-device copy.
+        that is registered once trades that for a copy. TCP uses pinned host
+        memory because Mooncake cannot GPUDirect over TCP.
         """
+        device = self._transport_device(device)
         if self._producer_pool is not None or self._producer_pool_disabled:
             return
         with self._producer_pool_lock:
             if self._producer_pool is not None or self._producer_pool_disabled:
                 return
             try:
-                pool = torch.empty(
-                    self._producer_pool_capacity, dtype=torch.uint8, device=device
+                pool = self._alloc_transport_buffer(
+                    self._producer_pool_capacity, device
                 )
                 ret = self._ensure_engine().batch_register_memory(
                     [pool.data_ptr()], [pool.nbytes]
@@ -1119,7 +1164,7 @@ class ECMooncakeConnector(ECConnectorBase):
         """Copy the batch into the staging pool; None if it does not fit."""
         if not tensors:
             return [], []
-        self._ensure_producer_pool(tensors[0].device)
+        self._ensure_producer_pool(self._transport_device(tensors[0].device))
         pool = self._producer_pool
         allocator = self._producer_pool_allocator
         if pool is None or allocator is None:
@@ -1211,7 +1256,7 @@ class ECMooncakeConnector(ECConnectorBase):
             self._consumer_residents.pin(spec.mm_hash)
             self._consumer_retire_events.pop(spec.mm_hash, None)
             self._consumer_worker_metrics["residents_promoted"] += 1
-            return tensor
+            return self._materialize_for_encoder_cache(tensor)
 
     def _release_stale_consumer_allocations(
         self, encoder_cache: dict[str, torch.Tensor]
@@ -1234,13 +1279,17 @@ class ECMooncakeConnector(ECConnectorBase):
                 if id(allocation) in reserved_allocations:
                     continue
                 # Retire rather than free: the bytes stay valid and serve the
-                # next request that needs this item. The event orders the
-                # eventual reuse behind whatever still reads the tensor.
-                event = torch.Event()
-                event.record(
-                    torch.accelerator.current_stream(self._consumer_pool.device)
-                )
-                self._consumer_retire_events[mm_hash] = event
+                # next request that needs this item. CUDA events order reuse
+                # behind in-flight GPU reads; host TCP pools are already
+                # synchronized by the materialize copy.
+                if self._consumer_pool.device.type == "cuda":
+                    event = torch.Event()
+                    event.record(
+                        torch.accelerator.current_stream(
+                            self._consumer_pool.device
+                        )
+                    )
+                    self._consumer_retire_events[mm_hash] = event
                 self._consumer_residents.retire(mm_hash)
                 self._consumer_worker_metrics["residents_retired"] += 1
         self._poll_consumer_pool_frees()
@@ -1625,7 +1674,10 @@ class ECMooncakeConnector(ECConnectorBase):
                 spec.mm_hash, reservation.allocation, reservation.allocation.size
             )
             self._consumer_worker_metrics["reservations_taken"] += 1
-            return reservation.allocation.tensor, reservation.allocation
+            return (
+                self._materialize_for_encoder_cache(reservation.allocation.tensor),
+                reservation.allocation,
+            )
 
     def _send_control(self, addr: str, request: dict[str, Any]) -> Any:
         return self._control_channel.request(addr, request)
@@ -1897,9 +1949,15 @@ class ECMooncakeConnector(ECConnectorBase):
                     sources, staged_regions = staged
                     # The NIC reads outside the CUDA stream, so the staging
                     # copies have to have landed before the transfer starts.
+                    # TCP stages onto host, so wait on the original CUDA
+                    # tensors rather than the CPU views.
                     if sources and sources[0].device.type == "cuda":
                         torch.accelerator.current_stream(
                             sources[0].device
+                        ).synchronize()
+                    elif tensors and tensors[0].device.type == "cuda":
+                        torch.accelerator.current_stream(
+                            tensors[0].device
                         ).synchronize()
                 else:
                     sources = tensors

@@ -1696,3 +1696,69 @@ class TestECMooncakeWorkerTransfer:
             )
             mm_hash = mock_request_with_3_mm.mm_features[0].identifier
             assert not scheduler.has_cache_item(mm_hash)
+
+
+class TestECMooncakeTCPTransport:
+    def test_default_protocol_is_tcp(self, mock_vllm_config_producer):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config = {}
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            try:
+                assert connector._protocol == "tcp"
+                assert connector._uses_host_transport()
+                assert connector._transport_device(torch.device("cuda")).type == "cpu"
+            finally:
+                connector.shutdown()
+
+    def test_rdma_keeps_requested_cuda_transport(self, mock_vllm_config_producer):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config = {
+            "mooncake_protocol": "rdma",
+        }
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            try:
+                assert connector._protocol == "rdma"
+                assert not connector._uses_host_transport()
+                cuda = torch.device("cuda")
+                assert connector._transport_device(cuda).type == "cuda"
+            finally:
+                connector.shutdown()
+
+    def test_tcp_consumer_pool_stays_on_host_when_buffer_device_is_cuda(
+        self, mock_vllm_config_consumer
+    ):
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_device = "cuda"
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_size = 4096
+        mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config[
+            "consumer_buffer_pool_size"
+        ] = 4096
+        with patch_ec_mooncake_deps():
+            consumer = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.WORKER
+            )
+            try:
+                consumer._ensure_consumer_pool(torch.device("cuda"))
+                assert consumer._consumer_pool is not None
+                assert consumer._consumer_pool.device.type == "cpu"
+            finally:
+                consumer.shutdown()
+
+    def test_tcp_materialize_keeps_cpu_when_buffer_device_is_cpu(
+        self, mock_vllm_config_consumer
+    ):
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_device = "cpu"
+        host = torch.randn(4, 8)
+        with patch_ec_mooncake_deps():
+            consumer = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.WORKER
+            )
+            try:
+                out = consumer._materialize_for_encoder_cache(host)
+                assert out.device.type == "cpu"
+                assert torch.equal(out, host)
+            finally:
+                consumer.shutdown()
