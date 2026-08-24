@@ -5,7 +5,7 @@ Encoder-cache (EC) connector backed by Mooncake TransferEngine.
 
 Used in disaggregated setups where an encoder / prefill instance produces
 multimodal encoder outputs and a decode instance loads them over Mooncake
-(TCP by default; RDMA when ``mooncake_protocol`` is set) instead of a
+(RDMA by default; TCP when ``mooncake_protocol`` is ``tcp``) instead of a
 shared filesystem.
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import os
 import threading
 import time
 import uuid
@@ -622,11 +623,15 @@ class ECMooncakeConnector(ECConnectorBase):
     Extra config (``ec_connector_extra_config``):
 
     - ``mooncake_protocol`` (optional): Passed to ``TransferEngine.initialize``
-      (default ``"tcp"``, which works without RDMA NICs; set ``"rdma"``
-      when GPUDirect RDMA is available).
+      (default ``"rdma"``; set ``"tcp"`` when no verbs device is available).
+    - ``mooncake_device`` (optional): RDMA device name passed as the
+      TransferEngine NIC list (empty string lets Mooncake auto-discover).
+    - ``mooncake_host_buffers`` (optional): Force pinned-host bounce buffers.
+      Defaults to on for TCP, and for RDMA when GPUDirect is unavailable
+      (software RoCE / missing ``nvidia_peermem``).
     - ``consumer_buffer_pool_size`` (consumer, optional): Bytes reserved for a
-      long-lived registered receive arena (pinned host for TCP, CUDA for
-      RDMA; default ``ec_buffer_size``).
+      long-lived registered receive arena (pinned host when GPUDirect is
+      unavailable, CUDA otherwise; default ``ec_buffer_size``).
     - ``reservation_zmq_port`` (consumer worker, required): Exposes registered
       receive addresses over ZMQ. Replica ``d`` of the first pipeline stage owns
       the block starting at ``port + d * tensor_parallel_size``; tensor-parallel
@@ -709,7 +714,7 @@ class ECMooncakeConnector(ECConnectorBase):
         self._ec_cfg = ec_cfg
         self._extra = self._ec_cfg.ec_connector_extra_config
         self._protocol: str = str(
-            self._extra.get("mooncake_protocol", "tcp")
+            self._extra.get("mooncake_protocol", "rdma")
         ).lower()
         reservation_port = self._extra.get("reservation_zmq_port")
         self._reservation_zmq_port = (
@@ -863,7 +868,10 @@ class ECMooncakeConnector(ECConnectorBase):
             if self._engine is not None:
                 return self._engine
             eng = TransferEngine()
-            ret = eng.initialize(self._hostname, "P2PHANDSHAKE", self._protocol, "")
+            device = str(self._extra.get("mooncake_device", "") or "")
+            ret = eng.initialize(
+                self._hostname, "P2PHANDSHAKE", self._protocol, device
+            )
             if ret != 0:
                 raise RuntimeError("Mooncake TransferEngine initialization failed.")
             self._engine = eng
@@ -1046,9 +1054,32 @@ class ECMooncakeConnector(ECConnectorBase):
                 self._pending_unregister.pop(address, None)
             return True
 
+    def _has_gpu_direct_rdma(self) -> bool:
+        """True when CUDA buffers can be registered for GPUDirect RDMA."""
+        if os.environ.get("WITH_NVIDIA_PEERMEM", "1") == "0":
+            return False
+        ib_root = "/sys/class/infiniband"
+        try:
+            names = os.listdir(ib_root)
+        except OSError:
+            return False
+        if not names or all(name.startswith("rxe") for name in names):
+            return False
+        return os.path.exists("/sys/module/nvidia_peermem")
+
     def _uses_host_transport(self) -> bool:
-        """TCP cannot GPUDirect; buffers live in pinned host memory."""
-        return self._protocol == "tcp"
+        """Use pinned host bounce buffers when GPUDirect is not usable.
+
+        TCP never GPUDirects. RDMA still needs host staging on software RoCE
+        or hosts without ``nvidia_peermem``; otherwise CUDA pointers hang
+        inside ``batch_transfer_sync_write``.
+        """
+        flag = self._extra.get("mooncake_host_buffers")
+        if flag is not None:
+            return bool(flag)
+        if self._protocol == "tcp":
+            return True
+        return not self._has_gpu_direct_rdma()
 
     def _transport_device(self, requested: torch.device) -> torch.device:
         if self._uses_host_transport():

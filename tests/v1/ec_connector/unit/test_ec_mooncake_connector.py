@@ -1699,22 +1699,26 @@ class TestECMooncakeWorkerTransfer:
 
 
 class TestECMooncakeTCPTransport:
-    def test_default_protocol_is_tcp(self, mock_vllm_config_producer):
+    def test_default_protocol_is_rdma(self, mock_vllm_config_producer):
         mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config = {}
         with patch_ec_mooncake_deps():
             connector = ECMooncakeConnector(
                 mock_vllm_config_producer, ECConnectorRole.WORKER
             )
             try:
-                assert connector._protocol == "tcp"
+                assert connector._protocol == "rdma"
+                # Software RoCE / missing nvidia_peermem cannot GPUDirect.
                 assert connector._uses_host_transport()
                 assert connector._transport_device(torch.device("cuda")).type == "cpu"
             finally:
                 connector.shutdown()
 
-    def test_rdma_keeps_requested_cuda_transport(self, mock_vllm_config_producer):
+    def test_rdma_keeps_requested_cuda_transport_when_host_buffers_disabled(
+        self, mock_vllm_config_producer
+    ):
         mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config = {
             "mooncake_protocol": "rdma",
+            "mooncake_host_buffers": False,
         }
         with patch_ec_mooncake_deps():
             connector = ECMooncakeConnector(
@@ -1725,6 +1729,21 @@ class TestECMooncakeTCPTransport:
                 assert not connector._uses_host_transport()
                 cuda = torch.device("cuda")
                 assert connector._transport_device(cuda).type == "cuda"
+            finally:
+                connector.shutdown()
+
+    def test_tcp_uses_host_transport(self, mock_vllm_config_producer):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config = {
+            "mooncake_protocol": "tcp",
+        }
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            try:
+                assert connector._protocol == "tcp"
+                assert connector._uses_host_transport()
+                assert connector._transport_device(torch.device("cuda")).type == "cpu"
             finally:
                 connector.shutdown()
 

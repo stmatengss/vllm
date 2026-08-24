@@ -13,7 +13,7 @@
 #   MODEL                    HF model id (default: Qwen/Qwen2.5-VL-3B-Instruct)
 #   GPU_SINGLE / GPU_E / GPU_PD   GPU ids (defaults 0 / 1 / 2)
 #   ENDPOINT_PORT, ENCODE_PORT, PREFILL_DECODE_PORT
-#   MOONCAKE_EC_PROTOCOL        tcp | rdma (default tcp; use rdma on IB/RoCE)
+#   MOONCAKE_EC_PROTOCOL        rdma | tcp (default rdma; use tcp without verbs)
 #   USE_MM_PROMPTS              1 (default) or 0 for text-only quick sanity
 #   TIMEOUT_SECONDS             wait_for_server timeout (default 1200)
 #   SKIP_BASELINE               set to 1 to reuse existing BASELINE_FILE
@@ -42,7 +42,7 @@ ENDPOINT_PORT="${ENDPOINT_PORT:-10002}"
 BASELINE_PORT="${BASELINE_PORT:-10003}"
 
 EC_MOONCAKE_RESERVATION_PORT="${EC_MOONCAKE_RESERVATION_PORT:-19019}"
-MOONCAKE_EC_PROTOCOL="${MOONCAKE_EC_PROTOCOL:-tcp}"
+MOONCAKE_EC_PROTOCOL="${MOONCAKE_EC_PROTOCOL:-rdma}"
 export EC_MOONCAKE_RESERVATION_PORT
 export MOONCAKE_EC_PROTOCOL
 # Mooncake cannot register CUDA memory through the peer-memory path on hosts
@@ -65,7 +65,7 @@ print(json.dumps({
     "ec_connector": "ECMooncakeConnector",
     "ec_role": "ec_producer",
     "ec_connector_extra_config": {
-        "mooncake_protocol": os.environ.get("MOONCAKE_EC_PROTOCOL", "tcp"),
+        "mooncake_protocol": os.environ.get("MOONCAKE_EC_PROTOCOL", "rdma"),
     },
 }, separators=(",", ":")))
 PY
@@ -77,7 +77,7 @@ print(json.dumps({
     "ec_connector": "ECMooncakeConnector",
     "ec_role": "ec_consumer",
     "ec_connector_extra_config": {
-        "mooncake_protocol": os.environ.get("MOONCAKE_EC_PROTOCOL", "tcp"),
+        "mooncake_protocol": os.environ.get("MOONCAKE_EC_PROTOCOL", "rdma"),
         "reservation_zmq_port": int(
             os.environ.get("EC_MOONCAKE_RESERVATION_PORT", "19019")
         ),
