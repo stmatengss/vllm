@@ -694,6 +694,12 @@ pull_request_rules:
       - files~=^tests/v1/kv_connector/.*mooncake
       - files~=^tests/v1/ec_connector/.*mooncake
       - files~=^docs/features/mooncake.*\.md
+      # Cross-encoder cache is Mooncake Store reuse. The paths do not
+      # contain "mooncake", so the patterns above do not match.
+      - files=docs/features/cross_encoder_cache.md
+      - files=tests/v1/ec_connector/unit/test_cross_encoder_cache.py
+      # Example proxy and launcher live outside the connector packages.
+      - files~=^examples/disaggregated/mooncake_connector/
       - files=.buildkite/test_areas/disaggregated_mooncake.yaml
       - title~=(?i)mooncake
   actions:
