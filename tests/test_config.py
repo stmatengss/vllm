@@ -1723,8 +1723,43 @@ def test_engram_hash_tracks_execution_options():
         EngramConfig(cpu_offload=False),
         EngramConfig(cpu_offload=True, embedding_across_dp=True),
         EngramConfig(cpu_offload=True, dp_shared_memory=True),
+        EngramConfig(storage_backend="mooncake"),
     ]
     assert len({config.compute_hash() for config in configs}) == len(configs)
+
+
+def test_engram_mooncake_rejects_incompatible_storage():
+    with pytest.raises(ValidationError):
+        EngramConfig(storage_backend="remote")
+    with pytest.raises(ValueError, match="requires cpu_offload"):
+        EngramConfig(storage_backend="mooncake", cpu_offload=False)
+    with pytest.raises(ValueError, match="dp_shared_memory"):
+        EngramConfig(storage_backend="mooncake", dp_shared_memory=True)
+    with pytest.raises(ValueError, match="use_thp"):
+        EngramConfig(storage_backend="mooncake", use_thp=True)
+    with pytest.raises(ValueError, match="mooncake_local_dir"):
+        EngramConfig(storage_backend="mooncake", mooncake_local_dir="")
+
+
+def test_engram_mooncake_does_not_enable_dp_shared_memory():
+    parallel = ParallelConfig(data_parallel_size=2)
+    config = EngramConfig(storage_backend="mooncake")
+    config.resolve_dp_shared_memory(parallel)
+    assert config.dp_shared_memory is False
+
+
+def test_engram_mooncake_requires_cuda(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    model = SimpleNamespace(
+        architecture="DeepseekV41ForCausalLM",
+        hf_text_config=SimpleNamespace(engram_layer_ids=[1]),
+    )
+    config = EngramConfig(storage_backend="mooncake")
+    with pytest.raises(ValueError, match="requires NVIDIA CUDA"):
+        config.verify_model_config(model)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config.verify_model_config(model)
 
 
 @pytest.mark.parametrize("port", [1, 29550, 65535])

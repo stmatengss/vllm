@@ -139,6 +139,36 @@ and falls back to per-replica (or DP-sharded) tables with a warning when:
 Requirements: `cpu_offload` enabled, `--data-parallel-size > 1`, and a shared
 IPC namespace across the co-located replicas.
 
+## Mooncake store
+
+`storage_backend: "mooncake"` publishes each loaded table into a local
+[Mooncake EngramStore](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/design/store/engram.md)
+snapshot. The namespace includes a hash of the row bytes, so another process
+that loads the same shard attaches to the existing file instead of keeping a
+second copy. After publication, vLLM drops the staging tensor. The store keeps
+the only copy and serves lookups on the caller's CUDA stream, including the
+existing side-stream prefetch.
+
+This needs a CUDA build of Mooncake that provides `mooncake.engram.EngramStore`.
+Remote Mooncake lookup is not implemented. The backend also replaces
+`dp_shared_memory` and `use_thp`:
+
+```bash
+vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
+  --data-parallel-size 2 \
+  --engram-config '{
+    "storage_backend": "mooncake",
+    "mooncake_local_dir": "/dev/shm/vllm-engram"
+  }'
+```
+
+Qwen4Exp PLE tables use the same backend. Hashes, scales, projections and
+collectives stay in the model. DeepSeek packs each FP8 row with its ue8m0
+block scales; Qwen stores the embedding row and applies its scale afterward.
+Snapshots under `mooncake_local_dir` survive process exit and are reused when
+the bytes still match. Remove that directory to drop old checkpoints.
+Publication briefly holds both the staging tensor and the snapshot.
+
 ## Limitations
 
 - CUDA-alike platforms only.
@@ -146,3 +176,7 @@ IPC namespace across the co-located replicas.
   `--enable-dbo` and set `--ubatch-size 0`.
 - `dp_shared_memory` requires `cpu_offload`, `data_parallel_size > 1`, and is
   unsupported with elastic expert parallelism.
+- `storage_backend: "mooncake"` requires NVIDIA CUDA, `cpu_offload`, and a
+  Mooncake build with `mooncake.engram.EngramStore`. It cannot be combined
+  with `dp_shared_memory` or `use_thp`. Lookup reads the local snapshot; it
+  does not fetch rows from a remote Mooncake master.

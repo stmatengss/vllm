@@ -70,7 +70,7 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 # Engram host offload and its prefetch stream are neither ROCm- nor
 # NVIDIA-specific, so they are imported rather than duplicated.
-from ..nvidia.engram import Engram
+from ..nvidia.engram import Engram, publish_mooncake_engrams
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -1137,6 +1137,7 @@ class DeepseekV41LLMForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        publish_mooncake_engrams(self)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

@@ -29,6 +29,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.engram_store import create_engram_storage
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
@@ -46,6 +47,77 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
+
+
+def owned_engram_row_ids(
+    indices: torch.Tensor,
+    *,
+    head_start: int,
+    local_heads: int,
+    total_heads: int,
+    vocab_start: int,
+    vocab_end: int,
+) -> torch.Tensor:
+    """Map global hash ids onto this rank's rows. Missing heads stay ``-1``."""
+    if indices.ndim != 2:
+        raise ValueError("Engram hash ids must have shape [tokens, heads]")
+    stop = min(head_start + local_heads, total_heads, indices.shape[1])
+    selected = indices[:, head_start:stop]
+    if selected.shape[1] < local_heads:
+        pad = selected.new_full(
+            (selected.shape[0], local_heads - selected.shape[1]), -1
+        )
+        selected = torch.cat((selected, pad), dim=1)
+    owned = (selected >= vocab_start) & (selected < vocab_end)
+    return torch.where(owned, selected - vocab_start, torch.full_like(selected, -1))
+
+
+def dequantize_packed_engram(
+    packed: torch.Tensor,
+    dim: int,
+    block_size: int,
+    out: torch.Tensor,
+) -> None:
+    """Decode packed FP8 rows and ue8m0 block scales into ``out``."""
+    if dim % block_size:
+        raise ValueError("Engram head dim must be divisible by the scale block")
+    weight = packed[..., :dim].contiguous().view(torch.float8_e4m3fn)
+    scale_bytes = packed[..., dim:].contiguous()
+    values = weight.to(torch.float32)
+    scales = (scale_bytes.to(torch.int32) << 23).view(torch.float32)
+    scales = torch.repeat_interleave(scales, block_size, dim=-1)
+    out.copy_((values * scales).to(dtype=out.dtype))
+
+
+def lookup_mooncake_engram_rows(
+    storage,
+    ids: torch.Tensor,
+    *,
+    dim: int,
+    block_size: int,
+    out: torch.Tensor,
+    stream: int | None = None,
+) -> None:
+    """Gather packed Mooncake rows and dequantize them into ``out``."""
+    row_bytes = dim + dim // block_size
+    flat_ids = ids.reshape(-1, 1).contiguous()
+    if flat_ids.numel() == 0:
+        return
+    packed = torch.zeros(
+        (flat_ids.shape[0], 1, row_bytes),
+        dtype=torch.uint8,
+        device=ids.device,
+    )
+    storage.lookup(flat_ids, packed, stream=stream)
+    dequantize_packed_engram(packed.view(*ids.shape, row_bytes), dim, block_size, out)
+
+
+def publish_mooncake_engrams(root: torch.nn.Module) -> None:
+    """Publish every Mooncake Engram table under ``root`` once weights exist."""
+    for module in root.modules():
+        publish = getattr(type(module), "publish_mooncake", None)
+        if publish is not None:
+            module.publish_mooncake()
 
 
 def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
@@ -278,12 +350,32 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        use_mooncake: bool = False,
     ) -> None:
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.uses_mooncake = use_mooncake
+        self._mooncake_storage = None
+        self._mooncake_published = False
         self._packed: torch.Tensor | None = None
         self.dp_size = get_engram_dp_size()
+        if use_mooncake:
+            if dp_shared_memory or use_thp:
+                raise ValueError(
+                    "Mooncake Engram storage cannot be combined with "
+                    "dp_shared_memory or use_thp"
+                )
+            engram_config = get_current_vllm_config().engram_config
+            if engram_config is None or engram_config.storage_backend != "mooncake":
+                raise RuntimeError(
+                    "Mooncake Engram tables require "
+                    "EngramConfig.storage_backend='mooncake'"
+                )
+            self._mooncake_storage = create_engram_storage(
+                engram_config.mooncake_local_dir,
+                engram_config.mooncake_namespace,
+            )
         if dp_shared_memory:
             if not cpu_offload:
                 raise ValueError("dp_shared_memory requires cpu_offload=True")
@@ -295,24 +387,33 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                     "DP replicas to be co-located."
                 )
             self.dp_size = 1
-        if cpu_offload and not is_uva_available():
+        if cpu_offload and not use_mooncake and not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         super().__init__(num_embeddings, dim, head_sizes, block_size)
-        if cpu_offload:
+        if cpu_offload or use_mooncake:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
-            logger.info(
-                "Engram table offloaded to pinned host memory: %d rows x %d, "
-                "%.2f GiB %s",
-                self.part_num_embeddings,
-                dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-                "shared across DP replicas" if dp_shared_memory else "per rank",
-            )
+            if use_mooncake:
+                logger.info(
+                    "Engram table will be published to Mooncake: "
+                    "%d rows x %d, %.2f GiB",
+                    self.part_num_embeddings,
+                    dim,
+                    self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                )
+            else:
+                logger.info(
+                    "Engram table offloaded to pinned host memory: "
+                    "%d rows x %d, %.2f GiB %s",
+                    self.part_num_embeddings,
+                    dim,
+                    self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                    "shared across DP replicas" if dp_shared_memory else "per rank",
+                )
 
     def _get_shard_info(self) -> tuple[int, int]:
         if self.dp_size == 1:
@@ -320,6 +421,23 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.uses_mooncake:
+            # The checkpoint loader fills this buffer. Publication copies it
+            # into Mooncake and then drops the buffer.
+            return (
+                torch.empty(
+                    self.part_num_embeddings,
+                    self.dim,
+                    dtype=torch.float8_e4m3fn,
+                    device="cpu",
+                ),
+                torch.empty(
+                    self.part_num_embeddings,
+                    self.dim // self.block_size,
+                    dtype=torch.uint8,
+                    device="cpu",
+                ),
+            )
         if self.dp_shared_memory:
             group = get_engram_dp_group()
             assert group is not None
@@ -388,6 +506,55 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         assert self._views is not None
         return self._views
 
+    def publish_mooncake(self) -> None:
+        """Copy packed FP8 rows and ue8m0 scales into the shared store."""
+        if not self.uses_mooncake or self._mooncake_published:
+            return
+        if self._mooncake_storage is None:
+            raise RuntimeError("Mooncake Engram storage was not configured")
+        if self.weight.numel() == 0:
+            raise RuntimeError("Cannot publish an empty Engram table")
+        weight = self.weight.detach().to(device="cpu").contiguous().view(torch.uint8)
+        scales = self.weight_scale_inv.detach().to(device="cpu").contiguous()
+        if weight.shape[0] != scales.shape[0]:
+            raise RuntimeError("Engram weight and scale row counts differ")
+        self._mooncake_storage.initialize(torch.cat((weight, scales), dim=1))
+        self._mooncake_published = True
+        self.weight.data = self.weight.new_empty((0, self.dim))
+        self.weight_scale_inv.data = self.weight_scale_inv.new_empty(
+            (0, self.dim // self.block_size)
+        )
+
+    def lookup(
+        self,
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        background: bool = False,
+    ) -> None:
+        if not self.uses_mooncake:
+            return super().lookup(indices, out, background=background)
+        self.publish_mooncake()
+        local_ids = owned_engram_row_ids(
+            indices,
+            head_start=self.head_start,
+            local_heads=self.part_n_hash_cols,
+            total_heads=self.n_hash_cols,
+            vocab_start=self.vocab_start_idx,
+            vocab_end=self.vocab_end_idx,
+        )
+        stream = None
+        if indices.is_cuda:
+            stream = torch.cuda.current_stream(indices.device).cuda_stream
+        assert self._mooncake_storage is not None
+        lookup_mooncake_engram_rows(
+            self._mooncake_storage,
+            local_ids,
+            dim=self.dim,
+            block_size=self.block_size,
+            out=out,
+            stream=stream,
+        )
+
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if self.dp_size == 1:
             return super().forward(indices)
@@ -450,6 +617,7 @@ class Engram(BaseEngram):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            use_mooncake=engram_config.storage_backend == "mooncake",
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:

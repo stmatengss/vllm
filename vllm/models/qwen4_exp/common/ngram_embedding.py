@@ -15,9 +15,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_etp_group, get_tp_group
 from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.engram_store import create_engram_storage
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -205,6 +207,11 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             )
         return Qwen4ExpPLEFp8EmbeddingMethod()
 
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        publish = getattr(layer, "publish_mooncake", None)
+        if publish is not None:
+            publish()
+
     def apply(
         self,
         layer: nn.Module,
@@ -305,6 +312,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         sentinel = torch.finfo(torch.float32).min
         if torch.any(layer.weight_scale == sentinel):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
+        super().process_weights_after_loading(layer)
 
     def dequantize(
         self,
@@ -540,3 +548,133 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         )
         self._finalize_prefetch(self._prefetch_buffer, output)
         return output
+
+
+class Qwen4ExpPLEMooncakeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+    """PLE rows published to a shared local Mooncake EngramStore."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+    ) -> None:
+        # Skip the pinned class: it registers a UVA view of a private table.
+        Qwen4ExpPLEEmbedding.__init__(
+            self,
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+        )
+        engram_config = get_current_vllm_config().engram_config
+        if engram_config is None or engram_config.storage_backend != "mooncake":
+            raise RuntimeError(
+                "Mooncake PLE tables require EngramConfig.storage_backend='mooncake'"
+            )
+        self._storage = create_engram_storage(
+            engram_config.mooncake_local_dir,
+            engram_config.mooncake_namespace,
+        )
+        self._published = False
+        self._stored_dtype = self.weight.dtype
+        self._row_bytes = self.embedding_dim * self.weight.element_size()
+        if torch.cuda.is_available():
+            buffer_device = torch.device("cuda", torch.cuda.current_device())
+            self._prefetch_stream = torch.cuda.Stream(device=buffer_device)
+        else:
+            buffer_device = torch.device("cpu")
+            self._prefetch_stream = None
+        self._prefetch_buffer = torch.empty(
+            max_total_tokens * self.etp_data_parallel_size,
+            num_ngram_heads,
+            self.embedding_dim,
+            dtype=self._stored_dtype,
+            device=buffer_device,
+        )
+        self._output_dim = num_ngram_heads * self.embedding_dim
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Stage the checkpoint in ordinary CPU memory before publication."""
+        return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu")
+
+    def publish_mooncake(self) -> None:
+        """Copy loaded rows into Mooncake and drop the staging tensor."""
+        if self._published:
+            return
+        if self.weight.numel() == 0:
+            raise RuntimeError("Cannot publish an empty PLE table")
+        rows = self.weight.detach().to(device="cpu").contiguous().view(torch.uint8)
+        self._storage.initialize(rows.view(self.weight.shape[0], -1))
+        self._published = True
+        self.weight.data = self.weight.new_empty((0, self.embedding_dim))
+
+    def _mask_row_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+        owned = (ids >= start) & (ids < end)
+        return torch.where(owned, ids - start, torch.full_like(ids, -1))
+
+    def _lookup(
+        self,
+        input_ids: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gather local rows from the shared store, in the weight dtype."""
+        self.publish_mooncake()
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        if output is None:
+            output = torch.empty(
+                expected_shape,
+                dtype=self._stored_dtype,
+                device=input_ids.device,
+            )
+        elif (
+            tuple(output.shape) != expected_shape
+            or output.dtype != self._stored_dtype
+            or output.device != input_ids.device
+        ):
+            raise ValueError(
+                "PLE prefetch output must match the input shape, weight dtype, "
+                "and input device"
+            )
+        flat_ids = self._mask_row_ids(input_ids.reshape(-1))
+        byte_out = torch.zeros(
+            (flat_ids.shape[0], 1, self._row_bytes),
+            dtype=torch.uint8,
+            device=input_ids.device,
+        )
+        if flat_ids.numel():
+            stream = None
+            if flat_ids.is_cuda:
+                stream = torch.cuda.current_stream(flat_ids.device).cuda_stream
+            self._storage.lookup(flat_ids.reshape(-1, 1), byte_out, stream=stream)
+        values = byte_out.view(self._stored_dtype).view(-1, self.embedding_dim)
+        output.view(-1, self.embedding_dim).copy_(values)
+        return output
+
+
+def select_ple_embedding_class(engram_config):
+    """Pick device, pinned-host, or Mooncake storage for one PLE table."""
+    if engram_config is not None and engram_config.storage_backend == "mooncake":
+        return Qwen4ExpPLEMooncakeEmbedding
+    if engram_config is not None and engram_config.cpu_offload:
+        return Qwen4ExpPLEPinnedHostEmbedding
+    return Qwen4ExpPLEDeviceEmbedding
