@@ -24,6 +24,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
+    select_ple_embedding_class,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -208,11 +209,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        embedding_cls = select_ple_embedding_class(engram_config)
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,

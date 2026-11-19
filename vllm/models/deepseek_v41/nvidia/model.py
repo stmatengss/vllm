@@ -100,7 +100,12 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import EngramLayout, NgramHashState
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
-from .engram import Engram, can_share_engram_tables, gather_engram_hashes
+from .engram import (
+    Engram,
+    can_share_engram_tables,
+    gather_engram_hashes,
+    publish_mooncake_engrams,
+)
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
     init_mhc_all_reduce,
@@ -1626,6 +1631,7 @@ class DeepseekV41LLMForCausalLM(
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         self.model.finalize_mega_attn_weights()
+        publish_mooncake_engrams(self)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

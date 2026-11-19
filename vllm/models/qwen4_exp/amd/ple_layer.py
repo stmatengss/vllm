@@ -35,9 +35,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ngram_embedding import (
-    Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
-    Qwen4ExpPLEPinnedHostEmbedding,
+    select_ple_embedding_class,
 )
 
 logger = init_logger(__name__)
@@ -247,11 +246,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             getattr(config, "ple_embedding_dtype", None),
         )
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        embedding_cls = select_ple_embedding_class(engram_config)
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
